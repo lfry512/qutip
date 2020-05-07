@@ -147,7 +147,8 @@ def mesolve(H, rho0, tlist, c_ops=None, e_ops=None, args=None, options=None,
     Parameters
     ----------
 
-    H : :class:`qutip.Qobj`
+    H : :class:`qutip.Qobj` / list of :class:`qutip.Qobj` / callback function 
+        single
         System Hamiltonian, or a callback function for time-dependent
         Hamiltonians, or alternatively a system Liouvillian.
 
@@ -157,9 +158,9 @@ def mesolve(H, rho0, tlist, c_ops=None, e_ops=None, args=None, options=None,
     tlist : *list* / *array*
         list of times for :math:`t`.
 
-    c_ops : None / list of :class:`qutip.Qobj`
+    c_ops : None / list of :class:`qutip.Qobj` / callback function single
         single collapse operator, or list of collapse operators, or a list
-        of Liouvillian superoperators.
+        of Liouvillian superoperators, or a single callback function.
 
     e_ops : None / list of :class:`qutip.Qobj` / callback function single
         single operator or list of operators for which to evaluate
@@ -231,8 +232,14 @@ def mesolve(H, rho0, tlist, c_ops=None, e_ops=None, args=None, options=None,
         args = {}
 
     check_use_openmp(options)
-
-    use_mesolve = ((c_ops and len(c_ops) > 0)
+    
+    c_ops_bool = False
+    if type(c_ops) is list:
+        c_ops_bool = (c_ops and len(c_ops) > 0)
+    elif callable(c_ops):
+        c_ops_bool = True
+    
+    use_mesolve = (c_ops_bool
                    or (not isket(rho0))
                    or (isinstance(H, Qobj) and issuper(H))
                    or (isinstance(H, QobjEvo) and issuper(H.cte))
@@ -242,16 +249,19 @@ def mesolve(H, rho0, tlist, c_ops=None, e_ops=None, args=None, options=None,
                             not options.rhs_with_state and issuper(H(0., args)))
                    or (not isinstance(H, (Qobj, QobjEvo)) and callable(H) and
                             options.rhs_with_state))
-
+    
     if not use_mesolve:
         return sesolve(H, rho0, tlist, e_ops=e_ops, args=args, options=options,
                     progress_bar=progress_bar, _safe_mode=_safe_mode)
 
-
     if isinstance(H, SolverSystem):
         ss = H
-    elif isinstance(H, (list, Qobj, QobjEvo)):
+    elif isinstance(H, (list, Qobj, QobjEvo)) and not callable(c_ops):
         ss = _mesolve_QobjEvo(H, c_ops, tlist, args, options)
+    elif isinstance(H, (list, Qobj, QobjEvo)) and callable(c_ops):
+        # This doesn't seem easy to do. Say not implemented for now
+        raise Exception("Using c_ops callback with Qobj or QobjEvo is not "
+        "supported currently.")
     elif callable(H):
         ss = _mesolve_func_td(H, c_ops, rho0, tlist, args, options)
     else:
@@ -335,6 +345,9 @@ class _LiouvillianFromFunc:
         for op in self.c_ops:
             Lt += op(t).data
         return Lt
+    
+    def H2L_c(self, t, rho, args):
+        return -1.0j * (spre(self.f(t, args)) - spost(self.f(t, args))).data + self.c_ops(t, args).data
 
     def H2L_with_state(self, t, rho, args):
         Ht = self.f(t, rho, args)
@@ -348,6 +361,9 @@ class _LiouvillianFromFunc:
         for op in self.c_ops:
             Lt += op(t).data
         return Lt
+    
+    def L_c(self, t, rho, args):
+        return self.f(t, args).data + self.c_ops(t, args).data
 
     def L_with_state(self, t, rho, args):
         Lt = self.f(t, rho, args).data
@@ -361,17 +377,20 @@ def _mesolve_func_td(L_func, c_op_list, rho0, tlist, args, opt):
     Evolve the density matrix using an ODE solver with time dependent
     Hamiltonian.
     """
-    c_ops = []
-    for op in c_op_list:
-        op_td = QobjEvo(op, args, tlist=tlist, copy=False)
-        if not issuper(op_td.cte):
-            c_ops += [lindblad_dissipator(op_td)]
+    if type(c_op_list) is list:
+        c_ops = []
+        for op in c_op_list:
+            op_td = QobjEvo(op, args, tlist=tlist, copy=False)
+            if not issuper(op_td.cte):
+                c_ops += [lindblad_dissipator(op_td)]
+            else:
+                c_ops += [op_td]
+        if c_op_list:
+            c_ops_ = [sum(c_ops)]
         else:
-            c_ops += [op_td]
-    if c_op_list:
-        c_ops_ = [sum(c_ops)]
-    else:
-        c_ops_ = []
+            c_ops_ = []
+    elif callable(c_op_list):
+        c_ops_ = c_op_list
 
     if opt.rhs_with_state:
         state0 = rho0.full().ravel("F")
@@ -382,10 +401,16 @@ def _mesolve_func_td(L_func, c_op_list, rho0, tlist, args, opt):
             L_func = _LiouvillianFromFunc(L_func, c_ops_).L_with_state
     else:
         obj = L_func(0., args)
-        if not issuper(obj):
-            L_func = _LiouvillianFromFunc(L_func, c_ops_).H2L
+        if callable(c_ops_):
+            if not issuper(obj):
+                L_func = _LiouvillianFromFunc(L_func, c_ops_).H2L_c
+            else:
+                L_func = _LiouvillianFromFunc(L_func, c_ops_).L_c
         else:
-            L_func = _LiouvillianFromFunc(L_func, c_ops_).L
+            if not issuper(obj):
+                L_func = _LiouvillianFromFunc(L_func, c_ops_).H2L
+            else:
+                L_func = _LiouvillianFromFunc(L_func, c_ops_).L
 
     ss = SolverSystem()
     ss.L = L_func
