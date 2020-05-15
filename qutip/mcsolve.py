@@ -57,6 +57,9 @@ import qutip.settings
 
 if debug:
     import inspect
+import sys
+import traceback
+import io
 
 #
 # Internal, global variables for storing references to dynamically loaded
@@ -300,35 +303,39 @@ class _MC():
         ss.td_n_ops = []
         ss.args = args
         ss.col_args = var
-        for c in c_ops:
-            cevo = QobjEvo(c, args, tlist=tlist)
-            cdc = cevo._cdc()
-            cevo.compile()
-            cdc.compile()
-            ss.td_c_ops.append(cevo)
-            ss.td_n_ops.append(cdc)
+        
+        if type(c_ops) is list:
+            
+            for c in c_ops: # Accounts for nested list format of c_ops
+                cevo = QobjEvo(c, args, tlist=tlist)
+                cdc = cevo._cdc()
+                cevo.compile()
+                cdc.compile()
+                ss.td_c_ops.append(cevo)
+                ss.td_n_ops.append(cdc)
 
-        try:
-            H_td = QobjEvo(H, args, tlist=tlist)
-            H_td *= -1j
-            for c in ss.td_n_ops:
-                H_td += -0.5 * c
-            if options.rhs_with_state:
-                H_td._check_old_with_state()
-            H_td.compile()
-            ss.H_td = H_td
-            ss.makefunc = _qobjevo_set
-            ss.set_args = _qobjevo_args
-            ss.type = "QobjEvo"
-
-        except:
-            ss.h_func = H
-            ss.Hc_td = -0.5 * sum(ss.td_n_ops)
-            ss.Hc_td.compile()
-            ss.with_state = options.rhs_with_state
-            ss.makefunc = _func_set
-            ss.set_args = _func_args
-            ss.type = "callback"
+            if isinstance(H, (list, Qobj, QobjEvo)):
+                H_td = QobjEvo(H, args, tlist=tlist)
+                H_td *= -1j
+                for c in ss.td_n_ops:
+                    H_td += -0.5 * c
+                if options.rhs_with_state:
+                    H_td._check_old_with_state()
+                H_td.compile()
+                ss.H_td = H_td
+                ss.makefunc = _qobjevo_set
+                ss.set_args = _qobjevo_args # <- redundant
+                ss.type = "QobjEvo"
+            elif callable(H):
+                ss.h_func = H
+                ss.Hc_td = -0.5 * sum(ss.td_n_ops)
+                ss.Hc_td.compile()
+                ss.with_state = options.rhs_with_state
+                ss.makefunc = _func_set
+                ss.set_args = _func_args # <- redundant
+                ss.type = "callback"
+        else:
+            raise Exception("Format of c_ops not supported.")
 
         solver_safe["mcsolve"] = ss
         self.ss = ss
@@ -358,14 +365,17 @@ class _MC():
         if self.ss.type == "QobjEvo":
             try:
                 self.ss.H_td.mul_vec(0., self.psi0)
+                print ("QobjEvo compilation type: "+self.ss.H_td.compiled)
+            except:
+                raise Exception("Error calculating H")
+        elif self.ss.type == "callback":
+            try:
+                rhs, ode_args = self.ss.makefunc(self.ss, args=self.ss.args)
+                rhs(0., self.psi0.full().ravel(), ode_args)
             except:
                 raise Exception("Error calculating H")
         else:
-            try:
-                rhs, ode_args = self.ss.makefunc(ss)
-                rhs(t, self.psi0.full().ravel(), ode_args)
-            except:
-                raise Exception("Error calculating H")
+            raise Exception("Unsupported solver system type '%s'" % str(self.ss.type))
 
     def run(self, num_traj=0, psi0=None, tlist=None,
             args={}, e_ops=None, options=None,
@@ -641,7 +651,32 @@ class _MC():
         tlist = self.tlist
         e_ops = self.e_ops.copy()
         opt = self.options
-        rhs, ode_args = self.ss.makefunc(ss)
+        rhs, ode_args = self.ss.makefunc(ss, args=ss.args)
+        
+        #try:
+        #    ODE = self._build_integration_func(rhs, ode_args, opt)
+        #    ODE.set_initial_value(self.initial_vector, tlist[0])
+        #    e_ops.init(tlist)
+
+        #    cymc = CyMcOde(ss, opt)
+        #    states_out, ss_out, collapses = cymc.run_ode(ODE, tlist, e_ops, prng)
+        #    
+        #    fd = open('/home/dustyd/Documents/Repositories/qutip/debug_out_%s.txt'%rhs.__name__, 'a')
+        #    fd.write(repr(ODE.f_params)+"\n")
+        #    fd.write(repr(opt)+"\n\n")
+        #    fd.close()
+        #    
+        #except Exception as exception:
+        #    strin = io.StringIO("")
+        #    traceback.print_tb(sys.exc_info()[2],file=strin)
+        #    
+        #    fd = open('/home/dustyd/Documents/Repositories/qutip/debug_out_%s.txt'%rhs.__name__, 'a')
+        #    fd.write(repr(ODE.f_params)+"\n")
+        #    fd.write(repr(opt)+"\n\n")
+        #    fd.close()
+        #
+        #    return [str(exception), repr(ode_args), strin.getvalue()]
+        
         ODE = self._build_integration_func(rhs, ode_args, opt)
         ODE.set_initial_value(self.initial_vector, tlist[0])
         e_ops.init(tlist)
@@ -663,6 +698,7 @@ class _MC():
         ODE = ode(rhs)
         if ode_args:
             ODE.set_f_params(ode_args)
+        
         # initialize ODE solver for RHS
         ODE.set_integrator('zvode', method="adams")
         ODE._integrator = qutip_zvode(
@@ -745,12 +781,12 @@ class _MC():
 # CODES FOR PYTHON FUNCTION BASED TIME-DEPENDENT RHS
 # -----------------------------------------------------------------------------
 def _qobjevo_set(ss, psi0=None, args={}, opt=None):
-    if args:
-        self.set_args(args)
+    #if args:
+    #    ss.set_args(ss, args)
     rhs = ss.H_td.compiled_qobjevo.mul_vec
     return rhs, ()
 
-def _qobjevo_args(ss, args):
+def _qobjevo_args(ss, args): # <- redundant
     var = _collapse_args(args)
     ss.col_args = var
     ss.args = args
@@ -760,18 +796,19 @@ def _qobjevo_args(ss, args):
     for c in ss.td_n_ops:
         c.solver_set_args(args, psi0, e_ops)
 
-def _func_set(HS, psi0=None, args={}, opt=None):
-    if args:
-        self.set_args(args)
-    else:
-        args = ss.args
+def _func_set(ss, psi0=None, args={}, opt=None):
+    #if args:
+    #    ss.set_args(ss, args)
+    #else:
+    #    args = ss.args
     if ss.with_state:
-        rhs = _funcrhs
-    else:
         rhs = _funcrhs_with_state
+    else:
+        rhs = _funcrhs
     return rhs, (ss.h_func, ss.Hc_td, args)
 
-def _func_args(ss, args):
+def _func_args(ss, args): # <- redundant
+    print ("_func_args")
     var = _collapse_args(args)
     ss.col_args = var
     ss.args = args
@@ -779,17 +816,21 @@ def _func_args(ss, args):
         c.solver_set_args(args, psi0, e_ops)
     for c in ss.td_n_ops:
         c.solver_set_args(args, psi0, e_ops)
-    return rhs, (ss.h_func, ss.Hc_td, args)
+    #return rhs, (ss.h_func, ss.Hc_td, args)
 
-
-# RHS of ODE for python function Hamiltonian
-def _funcrhs(t, psi, h_func, Hc_td, args):
-    h_func_data = -1.0j * h_func(t, args).data
+def _funcrhs(t, psi, args):
+    h_func = args[0]
+    Hc_td = args[1]
+    f_args = args[2]
+    h_func_data = -1.0j * h_func(t, f_args).data
     h_func_term = h_func_data * psi
     return h_func_term + Hc_td.mul_vec(t, psi)
 
-def _funcrhs_with_state(t, psi, h_func, Hc_td, args):
-    h_func_data = - 1.0j * h_func(t, psi, args).data
+def _funcrhs_with_state(t, psi, args):
+    h_func = args[0]
+    Hc_td = args[1]
+    f_args = args[2]
+    h_func_data = - 1.0j * h_func(t, psi, f_args).data
     h_func_term = h_func_data * psi
     return h_func_term + Hc_td.mul_vec(t, psi)
 
